@@ -1,6 +1,6 @@
 [package]
 name = "openlibrary"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 repository = "https://github.com/shelfwise/openlibrary"
 
@@ -13,7 +13,10 @@ indicatif = "0.17"
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }
 # rustls with bundled webpki roots: TLS works without a system CA store or
 # OpenSSL, so the binary runs on bare containers and cross-compiles cleanly.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "rustls-tls",
+] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
