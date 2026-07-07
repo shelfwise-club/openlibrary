@@ -3,9 +3,11 @@ use postgres::Client;
 
 // Tables are created in FK-dependency order (authors/works before
 // authorships/editions). The sequences are created up front because the
-// column defaults reference them by name; in the Rails database they already
-// exist (bigserial), so everything here is a no-op there. The OWNED BY links
-// let TRUNCATE ... RESTART IDENTITY reset the sequences on fresh databases.
+// column defaults reference them by name. In the Rails database the tables
+// already exist (as identity columns, whose backing sequences share these
+// names), so everything here is a no-op there. Don't add ALTER SEQUENCE
+// ... OWNED BY: it errors on identity sequences, and nothing needs the
+// ownership link since imports never truncate.
 const DDL: &str = "
 CREATE SEQUENCE IF NOT EXISTS authors_id_seq;
 CREATE SEQUENCE IF NOT EXISTS works_id_seq;
@@ -80,11 +82,6 @@ CREATE TABLE IF NOT EXISTS editions (
     CONSTRAINT works_fk FOREIGN KEY (work_id) REFERENCES works(id),
     PRIMARY KEY (id)
 );
-
-ALTER SEQUENCE authors_id_seq OWNED BY authors.id;
-ALTER SEQUENCE works_id_seq OWNED BY works.id;
-ALTER SEQUENCE authorships_id_seq OWNED BY authorships.id;
-ALTER SEQUENCE editions_id_seq OWNED BY editions.id;
 ";
 
 struct Index {
