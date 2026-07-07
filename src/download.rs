@@ -34,7 +34,7 @@ impl Source {
     }
 }
 
-pub fn run(dir: &Path, force: bool, source: &Source) -> Result<()> {
+pub fn run(dir: &Path, force: bool, source: &Source, only: Option<DumpType>) -> Result<()> {
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create {}", dir.display()))?;
 
@@ -52,8 +52,12 @@ pub fn run(dir: &Path, force: bool, source: &Source) -> Result<()> {
     }
     let multi = MultiProgress::new();
 
+    let types: &[DumpType] = match only {
+        Some(ref t) => std::slice::from_ref(t),
+        None => &DumpType::ALL,
+    };
     let results: Vec<(DumpType, Result<()>)> = std::thread::scope(|scope| {
-        let handles: Vec<_> = DumpType::ALL
+        let handles: Vec<_> = types
             .iter()
             .map(|&t| {
                 let bar = multi.add(ProgressBar::new_spinner());

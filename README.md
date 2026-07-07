@@ -10,6 +10,9 @@ CLI that downloads the [Open Library data dumps](https://openlibrary.org/develop
 # skip files that are already complete. Use --force to re-download.
 openlibrary download
 
+# Download a single dump type (authors, editions, or works).
+openlibrary download --only editions
+
 # Download a specific dump date directly from archive.org instead — useful
 # when openlibrary.org is down or you want a pinned dump. Files are saved
 # under their dated names; import picks up whichever dump files are present

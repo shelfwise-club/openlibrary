@@ -26,6 +26,9 @@ struct Cli {
 enum Command {
     /// Download the latest Open Library data dumps
     Download {
+        /// Download only one dump type
+        #[arg(long, value_enum)]
+        only: Option<DumpType>,
         /// Directory to store the dumps
         #[arg(long, default_value = "./data")]
         dir: PathBuf,
@@ -63,6 +66,7 @@ enum Command {
 fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Download {
+            only,
             dir,
             force,
             archive,
@@ -77,7 +81,7 @@ fn main() -> Result<()> {
                 }
                 _ => download::Source::Latest,
             };
-            download::run(&dir, force, &source)
+            download::run(&dir, force, &source, only)
         }
         Command::Import {
             only,
