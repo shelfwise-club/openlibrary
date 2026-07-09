@@ -117,11 +117,53 @@ const AUTHORS_ON_KEPT_WORKS: &str = "AND open_library_id IN (
 const WORKS_WITH_STAGED_EDITIONS: &str =
     "AND open_library_id IN (SELECT work_olid FROM _import_editions_staging)";
 
-/// The slug-dedup scaffolding shared by every insert: rank new rows within
-/// their base_slug, look up the highest suffix that base already has in the
-/// live table, and emit `base` or `base--N`.
-fn slugged_insert_sql(table: &str, filter: &str, columns: &str, values: &str, joins: &str) -> String {
-    format!(
+enum MergeInsert<'a> {
+    /// Slug-assigning insert (authors/works/editions): prep + insert.
+    Slugged(&'a SluggedInsert),
+    /// Plain single-statement insert (authorships).
+    Plain(&'a str),
+}
+
+/// The two statements behind every slugged insert.
+struct SluggedInsert {
+    /// Builds `_import_slug_taken`: for each base slug among the new rows,
+    /// the highest suffix that base already has in the live table. Computed
+    /// BEFORE the insert so the lookup never touches the table while the
+    /// insert grows it — a correlated per-row probe against the insert
+    /// target degrades quadratically once the empty-table path has dropped
+    /// the slug index (the target heap grows under the scan).
+    prep: String,
+    /// The insert itself: rank new rows within their base_slug, offset by
+    /// the precomputed taken suffixes, emit `base` or `base--N`.
+    insert: String,
+}
+
+fn slugged_insert_sql(
+    table: &str,
+    filter: &str,
+    columns: &str,
+    values: &str,
+    joins: &str,
+) -> SluggedInsert {
+    let new_rows = format!(
+        "WHERE NOT EXISTS (SELECT 1 FROM {table} x WHERE x.open_library_id = _import_{table}_staging.open_library_id)
+        {filter}"
+    );
+    let prep = format!(
+        "
+DROP TABLE IF EXISTS _import_slug_taken;
+CREATE UNLOGGED TABLE _import_slug_taken AS
+SELECT n.base_slug,
+       max(CASE WHEN t.slug = n.base_slug THEN 1
+                ELSE (substring(t.slug FROM '([0-9]+)$'))::int END) AS taken
+FROM (SELECT DISTINCT base_slug FROM _import_{table}_staging {new_rows}) n
+JOIN {table} t ON t.slug = n.base_slug
+   OR (t.slug >= n.base_slug || '--' AND t.slug < n.base_slug || '-.'
+       AND t.slug ~ ('^' || n.base_slug || '--[0-9]+$'))
+GROUP BY n.base_slug;
+ANALYZE _import_slug_taken;"
+    );
+    let insert = format!(
         "
 INSERT INTO {table} ({columns}, slug, created_at, updated_at)
 SELECT {values},
@@ -133,23 +175,16 @@ FROM (
     FROM (
         SELECT DISTINCT ON (open_library_id) *
         FROM _import_{table}_staging
-        WHERE NOT EXISTS (SELECT 1 FROM {table} x WHERE x.open_library_id = _import_{table}_staging.open_library_id)
-        {filter}
+        {new_rows}
     ) s
 ) n
 {joins}
-LEFT JOIN LATERAL (
-    SELECT max(CASE WHEN t.slug = n.base_slug THEN 1
-                    ELSE (substring(t.slug FROM '([0-9]+)$'))::int END) AS taken
-    FROM {table} t
-    WHERE t.slug = n.base_slug
-       OR (t.slug >= n.base_slug || '--' AND t.slug < n.base_slug || '-.'
-           AND t.slug ~ ('^' || n.base_slug || '--[0-9]+$'))
-) o ON true"
-    )
+LEFT JOIN _import_slug_taken o ON o.base_slug = n.base_slug"
+    );
+    SluggedInsert { prep, insert }
 }
 
-fn insert_authors_sql(filter: &str) -> String {
+fn insert_authors_sql(filter: &str) -> SluggedInsert {
     slugged_insert_sql(
         "authors",
         filter,
@@ -170,7 +205,7 @@ UPDATE authors a SET
 FROM (SELECT DISTINCT ON (open_library_id) * FROM _import_authors_staging) s
 WHERE a.open_library_id = s.open_library_id";
 
-fn insert_works_sql(filter: &str) -> String {
+fn insert_works_sql(filter: &str) -> SluggedInsert {
     slugged_insert_sql(
         "works",
         filter,
@@ -204,7 +239,7 @@ ON CONFLICT (work_id, author_id) DO UPDATE SET
     position = EXCLUDED.position,
     updated_at = EXCLUDED.updated_at";
 
-fn insert_editions_sql() -> String {
+fn insert_editions_sql() -> SluggedInsert {
     slugged_insert_sql(
         "editions",
         "",
@@ -296,13 +331,13 @@ fn import_all(
     // the first one for the duration of the scan.
     let mut refs_client = connect(database_url)?;
     scan_works(client, &mut refs_client, dir)?;
-    merge(client, "works", Some(UPDATE_WORKS), Some(&insert_works_sql(WORKS_WITH_STAGED_EDITIONS)), now)?;
+    merge(client, "works", Some(UPDATE_WORKS), Some(MergeInsert::Slugged(&insert_works_sql(WORKS_WITH_STAGED_EDITIONS))), now)?;
 
     scan_authors(client, dir)?;
-    merge(client, "authors", Some(UPDATE_AUTHORS), Some(&insert_authors_sql(AUTHORS_ON_KEPT_WORKS)), now)?;
-    merge(client, "authorships", None, Some(UPSERT_AUTHORSHIPS), now)?;
+    merge(client, "authors", Some(UPDATE_AUTHORS), Some(MergeInsert::Slugged(&insert_authors_sql(AUTHORS_ON_KEPT_WORKS))), now)?;
+    merge(client, "authorships", None, Some(MergeInsert::Plain(UPSERT_AUTHORSHIPS)), now)?;
 
-    merge(client, "editions", Some(UPDATE_EDITIONS), Some(&insert_editions_sql()), now)?;
+    merge(client, "editions", Some(UPDATE_EDITIONS), Some(MergeInsert::Slugged(&insert_editions_sql())), now)?;
 
     recount_editions(client)?;
     recount_works(client)?;
@@ -321,7 +356,7 @@ fn only_editions(client: &mut Client, dir: &Path, now: NaiveDateTime, dev: bool)
     }
     client.batch_execute(STAGING_EDITIONS)?;
     stage_editions(client, dir, dev)?;
-    merge(client, "editions", Some(UPDATE_EDITIONS), Some(&insert_editions_sql()), now)?;
+    merge(client, "editions", Some(UPDATE_EDITIONS), Some(MergeInsert::Slugged(&insert_editions_sql())), now)?;
     recount_editions(client)?;
     drop_staging(client);
     println!("Import complete.");
@@ -351,7 +386,7 @@ fn only_works(
     let mut refs_client = connect(database_url)?;
     scan_works(client, &mut refs_client, dir)?;
     merge(client, "works", Some(UPDATE_WORKS), None, now)?;
-    merge(client, "authorships", None, Some(UPSERT_AUTHORSHIPS), now)?;
+    merge(client, "authorships", None, Some(MergeInsert::Plain(UPSERT_AUTHORSHIPS)), now)?;
     recount_works(client)?;
     drop_staging(client);
     println!("Import complete.");
@@ -366,7 +401,7 @@ fn merge(
     client: &mut Client,
     table: &str,
     update: Option<&str>,
-    insert: Option<&str>,
+    insert: Option<MergeInsert<'_>>,
     now: NaiveDateTime,
 ) -> Result<()> {
     let empty: bool = client
@@ -384,7 +419,16 @@ fn merge(
         })?;
     }
     let mut inserted: u64 = 0;
-    if let Some(sql) = insert {
+    if let Some(insert) = insert {
+        let (prep, sql) = match insert {
+            MergeInsert::Slugged(s) => (Some(s.prep.as_str()), s.insert.as_str()),
+            MergeInsert::Plain(sql) => (None, sql),
+        };
+        if let Some(prep) = prep {
+            with_step(&format!("resolving {table} slug suffixes"), |_| {
+                Ok(client.batch_execute(prep)?)
+            })?;
+        }
         inserted = with_step(&format!("inserting new {table}"), |_| {
             Ok(client.execute(sql, &[&now])?)
         })?;
@@ -694,7 +738,8 @@ fn drop_staging(client: &mut Client) {
         "DROP TABLE IF EXISTS _import_authors_staging;
          DROP TABLE IF EXISTS _import_works_staging;
          DROP TABLE IF EXISTS _import_editions_staging;
-         DROP TABLE IF EXISTS _import_work_author_refs",
+         DROP TABLE IF EXISTS _import_work_author_refs;
+         DROP TABLE IF EXISTS _import_slug_taken",
     );
 }
 
