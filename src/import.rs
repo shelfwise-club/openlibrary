@@ -17,7 +17,7 @@ use crate::model::{Author, Edition, Work, short_key};
 use crate::schema;
 
 /// How many editions `--dev` imports.
-const DEV_LIMIT: u64 = 200_000;
+const DEV_LIMIT: u64 = 1_000_000;
 /// `--dev` keeps editions published in this year or later.
 const DEV_MIN_YEAR: i32 = 1950;
 
