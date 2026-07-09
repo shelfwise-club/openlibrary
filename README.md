@@ -40,7 +40,7 @@ Rails-style tables: `authors`, `works`, `editions`, and an `authorships` join ta
 
 Imports are **upserts keyed on `open_library_id`**: dumps are streamed via binary `COPY` into unlogged `_import_*` staging tables, then merged with `INSERT … ON CONFLICT DO UPDATE` (foreign keys resolved by joining on `open_library_id`). Row ids are therefore stable across imports — app tables referencing works/editions/authors (activities, shelvings, …) are never touched and never break. `created_at` is preserved on existing rows; `updated_at` is bumped. Two consequences of the merge model: records that disappear from a newer dump (including author↔work links) are kept, not deleted, and the first import into empty tables is the fast path (secondary indexes are dropped and rebuilt around it) while subsequent reimports maintain indexes in place and run slower.
 
-Editions without a work reference (or whose work isn't in the database) are dropped, as are nameless authors and untitled works.
+Editions without a work reference (or whose work isn't in the database) are dropped, as are nameless authors and untitled works. Only editions whose language is `eng`, `fre`, `spa`, or `ita` are imported (matched on the edition's first language; editions with no language set are dropped) — the list is the `IMPORT_LANGUAGES` constant in `src/import.rs`.
 
 `--only` semantics:
 

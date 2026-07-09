@@ -25,6 +25,11 @@ const DEV_MIN_YEAR: i32 = 1950;
 /// build can't blow the btree entry size limit (~2704 bytes).
 const MAX_TITLE_CHARS: usize = 1000;
 
+/// Only editions in these languages are imported (MARC codes, matched against
+/// the edition's first language — the one stored in `editions.language`).
+/// Editions with no language set are dropped too.
+const IMPORT_LANGUAGES: &[&str] = &["eng", "fre", "spa", "ita"];
+
 // Everything is imported by upserting on open_library_id so that row ids stay
 // stable across imports — the Rails app has tables (activities, …) holding
 // foreign keys into these tables, which truncate-and-reload would break or
@@ -320,7 +325,14 @@ fn scan_authors(client: &mut Client, dir: &Path, keep: Option<&HashSet<String>>)
     )?;
     let mut writer = BinaryCopyInWriter::new(
         sink,
-        &[Type::TEXT, Type::TEXT, Type::TEXT, Type::TEXT, Type::TEXT, Type::TEXT],
+        &[
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+            Type::TEXT,
+        ],
     );
 
     let mut line = String::new();
@@ -395,8 +407,7 @@ fn scan_works(
     let refs_sink = refs_client.copy_in(
         "COPY _import_work_author_refs (work_olid, author_olid, position) FROM STDIN BINARY",
     )?;
-    let mut refs_writer =
-        BinaryCopyInWriter::new(refs_sink, &[Type::TEXT, Type::TEXT, Type::INT4]);
+    let mut refs_writer = BinaryCopyInWriter::new(refs_sink, &[Type::TEXT, Type::TEXT, Type::INT4]);
 
     let mut line = String::new();
     let mut written: u64 = 0;
@@ -495,6 +506,7 @@ fn stage_editions(
     let mut line = String::new();
     let mut staged: u64 = 0;
     let mut no_work: u64 = 0;
+    let mut wrong_language: u64 = 0;
     let mut skipped: u64 = 0;
     loop {
         line.clear();
@@ -514,6 +526,11 @@ fn stage_editions(
             no_work += 1;
             continue;
         };
+        let language = edition.languages.first();
+        if !matches!(language, Some(l) if IMPORT_LANGUAGES.contains(&l.as_str())) {
+            wrong_language += 1;
+            continue;
+        }
         let year = edition.publish_year();
         if dev && !dev_quality(&edition, year, max_year) {
             continue;
@@ -532,7 +549,7 @@ fn stage_editions(
             &edition.identifiers.google,
             &edition.isbn_10.first(),
             &edition.isbn_13.first(),
-            &edition.languages.first(),
+            &language,
             &edition.number_of_pages,
             &year,
             &edition.publishers.first(),
@@ -552,7 +569,10 @@ fn stage_editions(
         }
     }
     writer.finish()?;
-    let mut extra = format!("({no_work} without a work reference dropped)");
+    let mut extra = format!(
+        "({no_work} without a work dropped, {wrong_language} not in {})",
+        IMPORT_LANGUAGES.join("/")
+    );
     if skipped > 0 {
         extra.push_str(&format!(" ({skipped} malformed lines skipped)"));
     }
