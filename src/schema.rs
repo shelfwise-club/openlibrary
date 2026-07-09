@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS authors (
     birth_date TEXT,
     death_date TEXT,
     photo_id TEXT,
+    slug TEXT NOT NULL,
     PRIMARY KEY (id)
 );
 
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS works (
     first_publish_date TEXT,
     first_publish_year int4,
     subjects TEXT[] NOT NULL DEFAULT '{}',
+    slug TEXT NOT NULL,
     PRIMARY KEY (id)
 );
 
@@ -79,6 +81,7 @@ CREATE TABLE IF NOT EXISTS editions (
     series TEXT,
     edition_name TEXT,
     internet_archive_id TEXT,
+    slug TEXT NOT NULL,
     CONSTRAINT works_fk FOREIGN KEY (work_id) REFERENCES works(id),
     PRIMARY KEY (id)
 );
@@ -101,6 +104,12 @@ const INDEXES: &[Index] = &[
         name: "index_authors_on_open_library_id",
         ddl: "CREATE UNIQUE INDEX index_authors_on_open_library_id ON public.authors USING btree (open_library_id)",
         required: true,
+    },
+    Index {
+        table: "authors",
+        name: "index_authors_on_slug",
+        ddl: "CREATE UNIQUE INDEX index_authors_on_slug ON authors USING btree (slug)",
+        required: false,
     },
     Index {
         table: "authorships",
@@ -152,6 +161,12 @@ const INDEXES: &[Index] = &[
     },
     Index {
         table: "editions",
+        name: "index_editions_on_slug",
+        ddl: "CREATE UNIQUE INDEX index_editions_on_slug ON editions USING btree (slug)",
+        required: false,
+    },
+    Index {
+        table: "editions",
         name: "index_editions_on_work_id",
         ddl: "CREATE INDEX index_editions_on_work_id ON editions USING btree (work_id)",
         required: false,
@@ -167,6 +182,12 @@ const INDEXES: &[Index] = &[
         name: "index_works_on_open_library_id",
         ddl: "CREATE UNIQUE INDEX index_works_on_open_library_id ON works USING btree (open_library_id)",
         required: true,
+    },
+    Index {
+        table: "works",
+        name: "index_works_on_slug",
+        ddl: "CREATE UNIQUE INDEX index_works_on_slug ON works USING btree (slug)",
+        required: false,
     },
     Index {
         table: "works",

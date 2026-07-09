@@ -40,6 +40,7 @@ const STAGING_AUTHORS: &str = "
 DROP TABLE IF EXISTS _import_authors_staging;
 CREATE UNLOGGED TABLE _import_authors_staging (
     open_library_id TEXT NOT NULL,
+    base_slug TEXT NOT NULL,
     name TEXT NOT NULL,
     bio TEXT,
     birth_date TEXT,
@@ -51,6 +52,7 @@ const STAGING_WORKS: &str = "
 DROP TABLE IF EXISTS _import_works_staging;
 CREATE UNLOGGED TABLE _import_works_staging (
     open_library_id TEXT NOT NULL,
+    base_slug TEXT NOT NULL,
     title TEXT NOT NULL,
     subtitle TEXT,
     description TEXT,
@@ -65,6 +67,7 @@ DROP TABLE IF EXISTS _import_editions_staging;
 CREATE UNLOGGED TABLE _import_editions_staging (
     work_olid TEXT NOT NULL,
     open_library_id TEXT NOT NULL,
+    base_slug TEXT NOT NULL,
     title TEXT,
     subtitle TEXT,
     asin TEXT,
@@ -93,63 +96,102 @@ CREATE UNLOGGED TABLE _import_work_author_refs (
 )";
 
 // The dumps carry far more than the app wants (works whose editions were all
-// dropped, authors with no surviving books). Full/dev imports admit rows via
-// the staging-derived filters; --only refreshes are scoped to rows already in
-// the database so a partial reimport can never re-bloat it.
+// dropped, authors with no surviving books). Full/dev imports admit new rows
+// via the staging-derived filters below; --only refreshes run the UPDATE half
+// only, so a partial reimport can never re-bloat the database.
+//
+// Merging is split into UPDATE-existing + INSERT-new (instead of one ON
+// CONFLICT upsert) because slugs demand it: an existing row's slug must never
+// change (URLs), while a new row's slug needs deduplication — batch
+// duplicates are ranked with ROW_NUMBER and offset by suffixes already taken
+// in the table, then written as `base--N`. Slugified text can never contain
+// `--`, so generated slugs can't collide with natural ones.
 
 /// Full/dev: authors credited on at least one work that has a staged edition.
-const AUTHORS_ON_KEPT_WORKS: &str = "WHERE open_library_id IN (
+const AUTHORS_ON_KEPT_WORKS: &str = "AND open_library_id IN (
     SELECT r.author_olid
     FROM _import_work_author_refs r
     JOIN _import_editions_staging e ON e.work_olid = r.work_olid)";
-/// --only authors: refresh what's there, add nothing.
-const AUTHORS_ALREADY_IMPORTED: &str =
-    "WHERE open_library_id IN (SELECT open_library_id FROM authors)";
 
 /// Full/dev: works with at least one staged edition.
 const WORKS_WITH_STAGED_EDITIONS: &str =
-    "WHERE open_library_id IN (SELECT work_olid FROM _import_editions_staging)";
-/// --only works: refresh what's there, add nothing.
-const WORKS_ALREADY_IMPORTED: &str =
-    "WHERE open_library_id IN (SELECT open_library_id FROM works)";
+    "AND open_library_id IN (SELECT work_olid FROM _import_editions_staging)";
 
-fn upsert_authors_sql(filter: &str) -> String {
+/// The slug-dedup scaffolding shared by every insert: rank new rows within
+/// their base_slug, look up the highest suffix that base already has in the
+/// live table, and emit `base` or `base--N`.
+fn slugged_insert_sql(table: &str, filter: &str, columns: &str, values: &str, joins: &str) -> String {
     format!(
         "
-INSERT INTO authors (open_library_id, name, bio, birth_date, death_date, photo_id, created_at, updated_at)
-SELECT DISTINCT ON (open_library_id)
-    open_library_id, name, bio, birth_date, death_date, photo_id, $1::timestamp, $1::timestamp
-FROM _import_authors_staging
-{filter}
-ON CONFLICT (open_library_id) DO UPDATE SET
-    name = EXCLUDED.name,
-    bio = EXCLUDED.bio,
-    birth_date = EXCLUDED.birth_date,
-    death_date = EXCLUDED.death_date,
-    photo_id = EXCLUDED.photo_id,
-    updated_at = EXCLUDED.updated_at"
+INSERT INTO {table} ({columns}, slug, created_at, updated_at)
+SELECT {values},
+       CASE WHEN n.rn + COALESCE(o.taken, 0) = 1 THEN n.base_slug
+            ELSE n.base_slug || '--' || (n.rn + COALESCE(o.taken, 0)) END,
+       $1::timestamp, $1::timestamp
+FROM (
+    SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.base_slug ORDER BY s.open_library_id) AS rn
+    FROM (
+        SELECT DISTINCT ON (open_library_id) *
+        FROM _import_{table}_staging
+        WHERE open_library_id NOT IN (SELECT open_library_id FROM {table})
+        {filter}
+    ) s
+) n
+{joins}
+LEFT JOIN LATERAL (
+    SELECT max(CASE WHEN t.slug = n.base_slug THEN 1
+                    ELSE (substring(t.slug FROM '([0-9]+)$'))::int END) AS taken
+    FROM {table} t
+    WHERE t.slug = n.base_slug
+       OR (t.slug >= n.base_slug || '--' AND t.slug < n.base_slug || '-.'
+           AND t.slug ~ ('^' || n.base_slug || '--[0-9]+$'))
+) o ON true"
     )
 }
 
-fn upsert_works_sql(filter: &str) -> String {
-    format!(
-        "
-INSERT INTO works (open_library_id, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects, created_at, updated_at)
-SELECT DISTINCT ON (open_library_id)
-    open_library_id, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects, $1::timestamp, $1::timestamp
-FROM _import_works_staging
-{filter}
-ON CONFLICT (open_library_id) DO UPDATE SET
-    title = EXCLUDED.title,
-    subtitle = EXCLUDED.subtitle,
-    description = EXCLUDED.description,
-    first_publish_date = EXCLUDED.first_publish_date,
-    first_publish_year = EXCLUDED.first_publish_year,
-    cover_id = EXCLUDED.cover_id,
-    subjects = EXCLUDED.subjects,
-    updated_at = EXCLUDED.updated_at"
+fn insert_authors_sql(filter: &str) -> String {
+    slugged_insert_sql(
+        "authors",
+        filter,
+        "open_library_id, name, bio, birth_date, death_date, photo_id",
+        "n.open_library_id, n.name, n.bio, n.birth_date, n.death_date, n.photo_id",
+        "",
     )
 }
+
+const UPDATE_AUTHORS: &str = "
+UPDATE authors a SET
+    name = s.name,
+    bio = s.bio,
+    birth_date = s.birth_date,
+    death_date = s.death_date,
+    photo_id = s.photo_id,
+    updated_at = $1::timestamp
+FROM (SELECT DISTINCT ON (open_library_id) * FROM _import_authors_staging) s
+WHERE a.open_library_id = s.open_library_id";
+
+fn insert_works_sql(filter: &str) -> String {
+    slugged_insert_sql(
+        "works",
+        filter,
+        "open_library_id, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects",
+        "n.open_library_id, n.title, n.subtitle, n.description, n.first_publish_date, n.first_publish_year, n.cover_id, n.subjects",
+        "",
+    )
+}
+
+const UPDATE_WORKS: &str = "
+UPDATE works w SET
+    title = s.title,
+    subtitle = s.subtitle,
+    description = s.description,
+    first_publish_date = s.first_publish_date,
+    first_publish_year = s.first_publish_year,
+    cover_id = s.cover_id,
+    subjects = s.subjects,
+    updated_at = $1::timestamp
+FROM (SELECT DISTINCT ON (open_library_id) * FROM _import_works_staging) s
+WHERE w.open_library_id = s.open_library_id";
 
 const UPSERT_AUTHORSHIPS: &str = "
 INSERT INTO authorships (work_id, author_id, position, created_at, updated_at)
@@ -162,37 +204,39 @@ ON CONFLICT (work_id, author_id) DO UPDATE SET
     position = EXCLUDED.position,
     updated_at = EXCLUDED.updated_at";
 
-const UPSERT_EDITIONS: &str = "
-INSERT INTO editions (open_library_id, title, subtitle, asin, cover_id, format,
-    goodreads_id, google_books_id, isbn10, isbn13, language, page_count,
-    published_year, publisher, series, edition_name, internet_archive_id,
-    work_id, created_at, updated_at)
-SELECT DISTINCT ON (s.open_library_id)
-    s.open_library_id, s.title, s.subtitle, s.asin, s.cover_id, s.format,
-    s.goodreads_id, s.google_books_id, s.isbn10, s.isbn13, s.language, s.page_count,
-    s.published_year, s.publisher, s.series, s.edition_name, s.internet_archive_id,
-    w.id, $1::timestamp, $1::timestamp
-FROM _import_editions_staging s
+fn insert_editions_sql() -> String {
+    slugged_insert_sql(
+        "editions",
+        "",
+        "open_library_id, title, subtitle, asin, cover_id, format, goodreads_id, google_books_id, isbn10, isbn13, language, page_count, published_year, publisher, series, edition_name, internet_archive_id, work_id",
+        "n.open_library_id, n.title, n.subtitle, n.asin, n.cover_id, n.format, n.goodreads_id, n.google_books_id, n.isbn10, n.isbn13, n.language, n.page_count, n.published_year, n.publisher, n.series, n.edition_name, n.internet_archive_id, w.id",
+        "JOIN works w ON w.open_library_id = n.work_olid",
+    )
+}
+
+const UPDATE_EDITIONS: &str = "
+UPDATE editions e SET
+    title = s.title,
+    subtitle = s.subtitle,
+    asin = s.asin,
+    cover_id = s.cover_id,
+    format = s.format,
+    goodreads_id = s.goodreads_id,
+    google_books_id = s.google_books_id,
+    isbn10 = s.isbn10,
+    isbn13 = s.isbn13,
+    language = s.language,
+    page_count = s.page_count,
+    published_year = s.published_year,
+    publisher = s.publisher,
+    series = s.series,
+    edition_name = s.edition_name,
+    internet_archive_id = s.internet_archive_id,
+    work_id = w.id,
+    updated_at = $1::timestamp
+FROM (SELECT DISTINCT ON (open_library_id) * FROM _import_editions_staging) s
 JOIN works w ON w.open_library_id = s.work_olid
-ON CONFLICT (open_library_id) DO UPDATE SET
-    title = EXCLUDED.title,
-    subtitle = EXCLUDED.subtitle,
-    asin = EXCLUDED.asin,
-    cover_id = EXCLUDED.cover_id,
-    format = EXCLUDED.format,
-    goodreads_id = EXCLUDED.goodreads_id,
-    google_books_id = EXCLUDED.google_books_id,
-    isbn10 = EXCLUDED.isbn10,
-    isbn13 = EXCLUDED.isbn13,
-    language = EXCLUDED.language,
-    page_count = EXCLUDED.page_count,
-    published_year = EXCLUDED.published_year,
-    publisher = EXCLUDED.publisher,
-    series = EXCLUDED.series,
-    edition_name = EXCLUDED.edition_name,
-    internet_archive_id = EXCLUDED.internet_archive_id,
-    work_id = EXCLUDED.work_id,
-    updated_at = EXCLUDED.updated_at";
+WHERE e.open_library_id = s.open_library_id";
 
 pub fn run(dir: &Path, database_url: &str, only: Option<DumpType>, dev: bool) -> Result<()> {
     let mut client = connect(database_url)?;
@@ -250,13 +294,13 @@ fn import_all(
     // the first one for the duration of the scan.
     let mut refs_client = connect(database_url)?;
     scan_works(client, &mut refs_client, dir)?;
-    merge(client, "works", &upsert_works_sql(WORKS_WITH_STAGED_EDITIONS), now)?;
+    merge(client, "works", Some(UPDATE_WORKS), Some(&insert_works_sql(WORKS_WITH_STAGED_EDITIONS)), now)?;
 
     scan_authors(client, dir)?;
-    merge(client, "authors", &upsert_authors_sql(AUTHORS_ON_KEPT_WORKS), now)?;
-    merge(client, "authorships", UPSERT_AUTHORSHIPS, now)?;
+    merge(client, "authors", Some(UPDATE_AUTHORS), Some(&insert_authors_sql(AUTHORS_ON_KEPT_WORKS)), now)?;
+    merge(client, "authorships", None, Some(UPSERT_AUTHORSHIPS), now)?;
 
-    merge(client, "editions", UPSERT_EDITIONS, now)?;
+    merge(client, "editions", Some(UPDATE_EDITIONS), Some(&insert_editions_sql()), now)?;
 
     recount_editions(client)?;
     recount_works(client)?;
@@ -275,7 +319,7 @@ fn only_editions(client: &mut Client, dir: &Path, now: NaiveDateTime, dev: bool)
     }
     client.batch_execute(STAGING_EDITIONS)?;
     stage_editions(client, dir, dev)?;
-    merge(client, "editions", UPSERT_EDITIONS, now)?;
+    merge(client, "editions", Some(UPDATE_EDITIONS), Some(&insert_editions_sql()), now)?;
     recount_editions(client)?;
     drop_staging(client);
     println!("Import complete.");
@@ -286,7 +330,7 @@ fn only_editions(client: &mut Client, dir: &Path, now: NaiveDateTime, dev: bool)
 fn only_authors(client: &mut Client, dir: &Path, now: NaiveDateTime) -> Result<()> {
     client.batch_execute(STAGING_AUTHORS)?;
     scan_authors(client, dir)?;
-    merge(client, "authors", &upsert_authors_sql(AUTHORS_ALREADY_IMPORTED), now)?;
+    merge(client, "authors", Some(UPDATE_AUTHORS), None, now)?;
     drop_staging(client);
     println!("Import complete.");
     Ok(())
@@ -304,41 +348,61 @@ fn only_works(
     client.batch_execute(STAGING_REFS)?;
     let mut refs_client = connect(database_url)?;
     scan_works(client, &mut refs_client, dir)?;
-    merge(client, "works", &upsert_works_sql(WORKS_ALREADY_IMPORTED), now)?;
-    merge(client, "authorships", UPSERT_AUTHORSHIPS, now)?;
+    merge(client, "works", Some(UPDATE_WORKS), None, now)?;
+    merge(client, "authorships", None, Some(UPSERT_AUTHORSHIPS), now)?;
     recount_works(client)?;
     drop_staging(client);
     println!("Import complete.");
     Ok(())
 }
 
-/// Run a table's upsert. If the table is empty (first import), its secondary
-/// indexes are dropped for the load and rebuilt after; the unique indexes
-/// stay — they're the ON CONFLICT targets.
-fn merge(client: &mut Client, table: &str, upsert: &str, now: NaiveDateTime) -> Result<u64> {
+/// Merge staged rows into a table: refresh existing rows (never touching
+/// slug or created_at), insert new ones with freshly deduplicated slugs,
+/// then ensure indexes. On a first load into an empty table the secondary
+/// indexes are dropped for speed; the unique open_library_id indexes stay.
+fn merge(
+    client: &mut Client,
+    table: &str,
+    update: Option<&str>,
+    insert: Option<&str>,
+    now: NaiveDateTime,
+) -> Result<()> {
     let empty: bool = client
         .query_one(&format!("SELECT NOT EXISTS (SELECT 1 FROM {table})"), &[])?
         .get(0);
     if empty {
         schema::drop_secondary_indexes(client, table)?;
     }
-    let n = with_step(&format!("upserting {table}"), |_| {
-        Ok(client.execute(upsert, &[&now])?)
-    })?;
-    with_step(&format!("indexing {table} ({n} rows upserted)"), |_| {
-        schema::create_indexes(client, table)
-    })?;
-    Ok(n)
+    let mut updated: u64 = 0;
+    if let Some(sql) = update
+        && !empty
+    {
+        updated = with_step(&format!("updating existing {table}"), |_| {
+            Ok(client.execute(sql, &[&now])?)
+        })?;
+    }
+    let mut inserted: u64 = 0;
+    if let Some(sql) = insert {
+        inserted = with_step(&format!("inserting new {table}"), |_| {
+            Ok(client.execute(sql, &[&now])?)
+        })?;
+    }
+    with_step(
+        &format!("indexing {table} ({inserted} inserted, {updated} updated)"),
+        |_| schema::create_indexes(client, table),
+    )?;
+    Ok(())
 }
 
 fn scan_authors(client: &mut Client, dir: &Path) -> Result<u64> {
     let (mut reader, bar) = open_dump(dir, DumpType::Authors)?;
     let sink = client.copy_in(
-        "COPY _import_authors_staging (open_library_id, name, bio, birth_date, death_date, photo_id) FROM STDIN BINARY",
+        "COPY _import_authors_staging (open_library_id, base_slug, name, bio, birth_date, death_date, photo_id) FROM STDIN BINARY",
     )?;
     let mut writer = BinaryCopyInWriter::new(
         sink,
         &[
+            Type::TEXT,
             Type::TEXT,
             Type::TEXT,
             Type::TEXT,
@@ -371,8 +435,10 @@ fn scan_authors(client: &mut Client, dir: &Path) -> Result<u64> {
             continue;
         };
         let photo_id = author.photos.first().map(i32::to_string);
+        let base_slug = base_slug(&name, olid);
         writer.write(&[
             &olid,
+            &base_slug,
             &name,
             &author.bio,
             &author.birth_date,
@@ -392,11 +458,12 @@ fn scan_authors(client: &mut Client, dir: &Path) -> Result<u64> {
 fn scan_works(client: &mut Client, refs_client: &mut Client, dir: &Path) -> Result<u64> {
     let (mut reader, bar) = open_dump(dir, DumpType::Works)?;
     let sink = client.copy_in(
-        "COPY _import_works_staging (open_library_id, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects) FROM STDIN BINARY",
+        "COPY _import_works_staging (open_library_id, base_slug, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects) FROM STDIN BINARY",
     )?;
     let mut writer = BinaryCopyInWriter::new(
         sink,
         &[
+            Type::TEXT,
             Type::TEXT,
             Type::TEXT,
             Type::TEXT,
@@ -439,8 +506,10 @@ fn scan_works(client: &mut Client, refs_client: &mut Client, dir: &Path) -> Resu
             .as_deref()
             .and_then(crate::model::extract_year);
         let cover_id = work.covers.first().map(i32::to_string);
+        let base_slug = base_slug(&title, olid);
         writer.write(&[
             &olid,
+            &base_slug,
             &title,
             &work.subtitle,
             &work.description,
@@ -470,11 +539,12 @@ fn stage_editions(client: &mut Client, dir: &Path, dev: bool) -> Result<u64> {
     let (mut reader, bar) = open_dump(dir, DumpType::Editions)?;
     let max_year = Utc::now().year() + 1;
     let sink = client.copy_in(
-        "COPY _import_editions_staging (work_olid, open_library_id, title, subtitle, asin, cover_id, format, goodreads_id, google_books_id, isbn10, isbn13, language, page_count, published_year, publisher, series, edition_name, internet_archive_id) FROM STDIN BINARY",
+        "COPY _import_editions_staging (work_olid, open_library_id, base_slug, title, subtitle, asin, cover_id, format, goodreads_id, google_books_id, isbn10, isbn13, language, page_count, published_year, publisher, series, edition_name, internet_archive_id) FROM STDIN BINARY",
     )?;
     let mut writer = BinaryCopyInWriter::new(
         sink,
         &[
+            Type::TEXT,
             Type::TEXT,
             Type::TEXT,
             Type::TEXT,
@@ -530,9 +600,11 @@ fn stage_editions(client: &mut Client, dir: &Path, dev: bool) -> Result<u64> {
         }
         let olid = short_key(key);
         let cover_id = edition.covers.first().map(i32::to_string);
+        let base_slug = edition_base_slug(&edition, olid);
         writer.write(&[
             &work_olid,
             &olid,
+            &base_slug,
             &edition.title,
             &edition.subtitle,
             &edition.identifiers.amazon,
@@ -617,6 +689,27 @@ fn drop_staging(client: &mut Client) {
          DROP TABLE IF EXISTS _import_editions_staging;
          DROP TABLE IF EXISTS _import_work_author_refs",
     );
+}
+
+/// Slug base for authors (from the name) and works (from the title); the
+/// record's open_library_id is the fallback when nothing slugifiable remains
+/// (e.g. punctuation-only or fully non-transliterable input).
+fn base_slug(text: &str, olid: &str) -> String {
+    let slug = crate::model::slugify(text);
+    if slug.is_empty() { olid.to_lowercase() } else { slug }
+}
+
+/// Edition slugs are `{isbn13|isbn10}-{slugged title}`, degrading to
+/// whichever half exists, then to the open_library_id.
+fn edition_base_slug(edition: &Edition, olid: &str) -> String {
+    let isbn = edition.isbn_13.first().or(edition.isbn_10.first());
+    let text = match (isbn, &edition.title) {
+        (Some(isbn), Some(title)) => format!("{isbn} {title}"),
+        (Some(isbn), None) => isbn.clone(),
+        (None, Some(title)) => title.clone(),
+        (None, None) => String::new(),
+    };
+    base_slug(&text, olid)
 }
 
 /// The `--dev` quality bar: a titled book from {DEV_MIN_YEAR} or later with a

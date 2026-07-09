@@ -50,4 +50,6 @@ Editions without a work reference (or whose work isn't in the database) are drop
 
 A full (or `--dev`) import is what admits new rows; the `--only` refreshes deliberately can't re-introduce records the filters dropped.
 
+Every row gets a URL slug at insert time (`slug`, NOT NULL + unique): authors from their transliterated name (`fiodor-dostoevskii`), works from their title, editions as `{isbn13|isbn10}-{title}` with each part degrading gracefully (final fallback: the open_library_id). Duplicates get `--N` suffixes (`john-smith--2`) — slugified text can never contain a double hyphen, so generated suffixes can't collide with natural slugs. A row's slug is assigned once and never changed by later imports, even if the name/title changes upstream, so app URLs stay stable.
+
 Records with malformed JSON are skipped and counted; inconsistent fields (string-or-object descriptions, string page counts, `-1` cover ids) are normalized during parsing. `published_year` is extracted from the free-form publish date, and external ids (`asin`, `goodreads_id`, `google_books_id`, `internet_archive_id`) come from the edition's `identifiers`/`ocaid` fields.

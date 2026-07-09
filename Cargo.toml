@@ -8,6 +8,7 @@ repository = "https://github.com/shelfwise/openlibrary"
 anyhow = "1"
 chrono = "0.4"
 clap = { version = "4", features = ["derive", "env"] }
+deunicode = "1"
 flate2 = "1"
 indicatif = "0.17"
 postgres = { version = "0.19", features = ["with-chrono-0_4"] }

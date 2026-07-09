@@ -14,6 +14,35 @@ pub fn short_key(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
 }
 
+/// URL slugs stay comfortably below btree index entry limits.
+const SLUG_MAX_CHARS: usize = 100;
+
+/// Transliterate to ASCII (Достоевский → dostoevskii), lowercase, collapse
+/// runs of anything non-alphanumeric to single hyphens, and clamp.
+///
+/// Returns an empty string when nothing survives (punctuation-only input) —
+/// callers fall back to the record's open_library_id. The output never
+/// contains `--`, which lets slug deduplication append `--N` suffixes that
+/// provably can't collide with any natural slug.
+pub fn slugify(input: &str) -> String {
+    let ascii = deunicode::deunicode(input).to_lowercase();
+    let mut slug = String::with_capacity(ascii.len().min(SLUG_MAX_CHARS));
+    for ch in ascii.chars() {
+        if slug.len() >= SLUG_MAX_CHARS {
+            break;
+        }
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    slug
+}
+
 /// First plausible 4-digit year found in a free-form publish date
 /// ("March 2005", "1995-03-01", "19??", …).
 pub fn extract_year(date: &str) -> Option<i32> {
