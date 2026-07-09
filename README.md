@@ -40,12 +40,14 @@ Rails-style tables: `authors`, `works`, `editions`, and an `authorships` join ta
 
 Imports are **upserts keyed on `open_library_id`**: dumps are streamed via binary `COPY` into unlogged `_import_*` staging tables, then merged with `INSERT … ON CONFLICT DO UPDATE` (foreign keys resolved by joining on `open_library_id`). Row ids are therefore stable across imports — app tables referencing works/editions/authors (activities, shelvings, …) are never touched and never break. `created_at` is preserved on existing rows; `updated_at` is bumped. Two consequences of the merge model: records that disappear from a newer dump (including author↔work links) are kept, not deleted, and the first import into empty tables is the fast path (secondary indexes are dropped and rebuilt around it) while subsequent reimports maintain indexes in place and run slower.
 
-Editions without a work reference (or whose work isn't in the database) are dropped, as are nameless authors and untitled works. Only editions whose language is `eng`, `fre`, `spa`, or `ita` are imported (matched on the edition's first language; editions with no language set are dropped) — the list is the `IMPORT_LANGUAGES` constant in `src/import.rs`.
+Editions without a work reference (or whose work isn't in the database) are dropped, as are nameless authors and untitled works. Only editions whose language is `eng`, `fre`, `spa`, or `ita` are imported (matched on the edition's first language; editions with no language set are dropped) — the list is the `IMPORT_LANGUAGES` constant in `src/import.rs`. The edition filter cascades: works are only imported if at least one of their editions survived, and authors only if they're credited on an imported work, so the dumps' long tail of unusable records never lands in the database.
 
 `--only` semantics:
 
 - `--only editions` — rescans the editions dump against the works already in the database. Requires works to be imported first.
-- `--only authors` — upserts authors; authorships and counts are untouched.
-- `--only works` — upserts works and refreshes authorships against the existing authors. Editions keep their (stable) `work_id`s.
+- `--only authors` — refreshes the authors already in the database (no new authors are added); authorships and counts are untouched.
+- `--only works` — refreshes the works already in the database (no new works are added) and re-resolves authorships. Editions keep their (stable) `work_id`s.
+
+A full (or `--dev`) import is what admits new rows; the `--only` refreshes deliberately can't re-introduce records the filters dropped.
 
 Records with malformed JSON are skipped and counted; inconsistent fields (string-or-object descriptions, string page counts, `-1` cover ids) are normalized during parsing. `published_year` is extracted from the free-form publish date, and external ids (`asin`, `goodreads_id`, `google_books_id`, `internet_archive_id`) come from the edition's `identifiers`/`ocaid` fields.

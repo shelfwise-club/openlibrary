@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -93,24 +92,53 @@ CREATE UNLOGGED TABLE _import_work_author_refs (
     position int4 NOT NULL
 )";
 
-const UPSERT_AUTHORS: &str = "
+// The dumps carry far more than the app wants (works whose editions were all
+// dropped, authors with no surviving books). Full/dev imports admit rows via
+// the staging-derived filters; --only refreshes are scoped to rows already in
+// the database so a partial reimport can never re-bloat it.
+
+/// Full/dev: authors credited on at least one work that has a staged edition.
+const AUTHORS_ON_KEPT_WORKS: &str = "WHERE open_library_id IN (
+    SELECT r.author_olid
+    FROM _import_work_author_refs r
+    JOIN _import_editions_staging e ON e.work_olid = r.work_olid)";
+/// --only authors: refresh what's there, add nothing.
+const AUTHORS_ALREADY_IMPORTED: &str =
+    "WHERE open_library_id IN (SELECT open_library_id FROM authors)";
+
+/// Full/dev: works with at least one staged edition.
+const WORKS_WITH_STAGED_EDITIONS: &str =
+    "WHERE open_library_id IN (SELECT work_olid FROM _import_editions_staging)";
+/// --only works: refresh what's there, add nothing.
+const WORKS_ALREADY_IMPORTED: &str =
+    "WHERE open_library_id IN (SELECT open_library_id FROM works)";
+
+fn upsert_authors_sql(filter: &str) -> String {
+    format!(
+        "
 INSERT INTO authors (open_library_id, name, bio, birth_date, death_date, photo_id, created_at, updated_at)
 SELECT DISTINCT ON (open_library_id)
     open_library_id, name, bio, birth_date, death_date, photo_id, $1::timestamp, $1::timestamp
 FROM _import_authors_staging
+{filter}
 ON CONFLICT (open_library_id) DO UPDATE SET
     name = EXCLUDED.name,
     bio = EXCLUDED.bio,
     birth_date = EXCLUDED.birth_date,
     death_date = EXCLUDED.death_date,
     photo_id = EXCLUDED.photo_id,
-    updated_at = EXCLUDED.updated_at";
+    updated_at = EXCLUDED.updated_at"
+    )
+}
 
-const UPSERT_WORKS: &str = "
+fn upsert_works_sql(filter: &str) -> String {
+    format!(
+        "
 INSERT INTO works (open_library_id, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects, created_at, updated_at)
 SELECT DISTINCT ON (open_library_id)
     open_library_id, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects, $1::timestamp, $1::timestamp
 FROM _import_works_staging
+{filter}
 ON CONFLICT (open_library_id) DO UPDATE SET
     title = EXCLUDED.title,
     subtitle = EXCLUDED.subtitle,
@@ -119,7 +147,9 @@ ON CONFLICT (open_library_id) DO UPDATE SET
     first_publish_year = EXCLUDED.first_publish_year,
     cover_id = EXCLUDED.cover_id,
     subjects = EXCLUDED.subjects,
-    updated_at = EXCLUDED.updated_at";
+    updated_at = EXCLUDED.updated_at"
+    )
+}
 
 const UPSERT_AUTHORSHIPS: &str = "
 INSERT INTO authorships (work_id, author_id, position, created_at, updated_at)
@@ -211,38 +241,21 @@ fn import_all(
     client.batch_execute(STAGING_EDITIONS)?;
     client.batch_execute(STAGING_REFS)?;
 
-    // Dev picks its editions first; the set of works they reference then
-    // drives which works (and transitively authors) get imported.
-    let keep_works = if dev {
-        let mut works = HashSet::new();
-        stage_editions(client, dir, true, Some(&mut works))?;
-        Some(works)
-    } else {
-        None
-    };
+    // Editions are staged first: the surviving editions decide which works
+    // get imported, and those works decide which authors — everything else
+    // in the dumps is dead weight for the app.
+    stage_editions(client, dir, dev)?;
 
     // The refs COPY runs on a second connection because the works COPY holds
     // the first one for the duration of the scan.
     let mut refs_client = connect(database_url)?;
-    scan_works(client, &mut refs_client, dir, keep_works.as_ref())?;
-    merge(client, "works", UPSERT_WORKS, now)?;
+    scan_works(client, &mut refs_client, dir)?;
+    merge(client, "works", &upsert_works_sql(WORKS_WITH_STAGED_EDITIONS), now)?;
 
-    let keep_authors = if dev {
-        let rows = client.query(
-            "SELECT DISTINCT author_olid FROM _import_work_author_refs",
-            &[],
-        )?;
-        Some(rows.iter().map(|r| r.get(0)).collect::<HashSet<String>>())
-    } else {
-        None
-    };
-    scan_authors(client, dir, keep_authors.as_ref())?;
-    merge(client, "authors", UPSERT_AUTHORS, now)?;
+    scan_authors(client, dir)?;
+    merge(client, "authors", &upsert_authors_sql(AUTHORS_ON_KEPT_WORKS), now)?;
     merge(client, "authorships", UPSERT_AUTHORSHIPS, now)?;
 
-    if !dev {
-        stage_editions(client, dir, false, None)?;
-    }
     merge(client, "editions", UPSERT_EDITIONS, now)?;
 
     recount_editions(client)?;
@@ -261,7 +274,7 @@ fn only_editions(client: &mut Client, dir: &Path, now: NaiveDateTime, dev: bool)
         );
     }
     client.batch_execute(STAGING_EDITIONS)?;
-    stage_editions(client, dir, dev, None)?;
+    stage_editions(client, dir, dev)?;
     merge(client, "editions", UPSERT_EDITIONS, now)?;
     recount_editions(client)?;
     drop_staging(client);
@@ -272,8 +285,8 @@ fn only_editions(client: &mut Client, dir: &Path, now: NaiveDateTime, dev: bool)
 /// Reimport authors. Ids are stable, so authorships and counts are untouched.
 fn only_authors(client: &mut Client, dir: &Path, now: NaiveDateTime) -> Result<()> {
     client.batch_execute(STAGING_AUTHORS)?;
-    scan_authors(client, dir, None)?;
-    merge(client, "authors", UPSERT_AUTHORS, now)?;
+    scan_authors(client, dir)?;
+    merge(client, "authors", &upsert_authors_sql(AUTHORS_ALREADY_IMPORTED), now)?;
     drop_staging(client);
     println!("Import complete.");
     Ok(())
@@ -290,8 +303,8 @@ fn only_works(
     client.batch_execute(STAGING_WORKS)?;
     client.batch_execute(STAGING_REFS)?;
     let mut refs_client = connect(database_url)?;
-    scan_works(client, &mut refs_client, dir, None)?;
-    merge(client, "works", UPSERT_WORKS, now)?;
+    scan_works(client, &mut refs_client, dir)?;
+    merge(client, "works", &upsert_works_sql(WORKS_ALREADY_IMPORTED), now)?;
     merge(client, "authorships", UPSERT_AUTHORSHIPS, now)?;
     recount_works(client)?;
     drop_staging(client);
@@ -318,7 +331,7 @@ fn merge(client: &mut Client, table: &str, upsert: &str, now: NaiveDateTime) -> 
     Ok(n)
 }
 
-fn scan_authors(client: &mut Client, dir: &Path, keep: Option<&HashSet<String>>) -> Result<u64> {
+fn scan_authors(client: &mut Client, dir: &Path) -> Result<u64> {
     let (mut reader, bar) = open_dump(dir, DumpType::Authors)?;
     let sink = client.copy_in(
         "COPY _import_authors_staging (open_library_id, name, bio, birth_date, death_date, photo_id) FROM STDIN BINARY",
@@ -348,11 +361,6 @@ fn scan_authors(client: &mut Client, dir: &Path, keep: Option<&HashSet<String>>)
             continue;
         };
         let olid = short_key(key);
-        if let Some(keep) = keep
-            && !keep.contains(olid)
-        {
-            continue;
-        }
         let Ok(author) = serde_json::from_str::<Author>(json) else {
             skipped += 1;
             continue;
@@ -381,12 +389,7 @@ fn scan_authors(client: &mut Client, dir: &Path, keep: Option<&HashSet<String>>)
     Ok(written)
 }
 
-fn scan_works(
-    client: &mut Client,
-    refs_client: &mut Client,
-    dir: &Path,
-    keep: Option<&HashSet<String>>,
-) -> Result<u64> {
+fn scan_works(client: &mut Client, refs_client: &mut Client, dir: &Path) -> Result<u64> {
     let (mut reader, bar) = open_dump(dir, DumpType::Works)?;
     let sink = client.copy_in(
         "COPY _import_works_staging (open_library_id, title, subtitle, description, first_publish_date, first_publish_year, cover_id, subjects) FROM STDIN BINARY",
@@ -422,11 +425,6 @@ fn scan_works(
             continue;
         };
         let olid = short_key(key);
-        if let Some(keep) = keep
-            && !keep.contains(olid)
-        {
-            continue;
-        }
         let Ok(work) = serde_json::from_str::<Work>(json) else {
             skipped += 1;
             continue;
@@ -466,14 +464,9 @@ fn scan_works(
 }
 
 /// Scan the editions dump into the staging table. With `dev`, only editions
-/// meeting the quality bar are kept, capped at DEV_LIMIT; `collect_works`
-/// receives the open_library_ids of the works they reference.
-fn stage_editions(
-    client: &mut Client,
-    dir: &Path,
-    dev: bool,
-    mut collect_works: Option<&mut HashSet<String>>,
-) -> Result<u64> {
+/// meeting the quality bar are kept, capped at DEV_LIMIT. The staged rows
+/// also decide which works and authors are worth importing.
+fn stage_editions(client: &mut Client, dir: &Path, dev: bool) -> Result<u64> {
     let (mut reader, bar) = open_dump(dir, DumpType::Editions)?;
     let max_year = Utc::now().year() + 1;
     let sink = client.copy_in(
@@ -560,9 +553,6 @@ fn stage_editions(
         staged += 1;
         if staged % 8192 == 0 {
             bar.set_message(format!("{staged} staged"));
-        }
-        if let Some(works) = collect_works.as_deref_mut() {
-            works.insert(work_olid.clone());
         }
         if dev && staged >= DEV_LIMIT {
             break;
