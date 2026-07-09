@@ -133,7 +133,7 @@ FROM (
     FROM (
         SELECT DISTINCT ON (open_library_id) *
         FROM _import_{table}_staging
-        WHERE open_library_id NOT IN (SELECT open_library_id FROM {table})
+        WHERE NOT EXISTS (SELECT 1 FROM {table} x WHERE x.open_library_id = _import_{table}_staging.open_library_id)
         {filter}
     ) s
 ) n
@@ -263,7 +263,9 @@ fn connect(database_url: &str) -> Result<Client> {
     })?;
     // Bulk-load tuning: crash-safety of individual commits doesn't matter here
     // (the import is restartable), and index builds want more memory.
-    client.batch_execute("SET synchronous_commit = off; SET maintenance_work_mem = '1GB'")?;
+    client.batch_execute(
+        "SET synchronous_commit = off; SET maintenance_work_mem = '1GB'; SET work_mem = '256MB'",
+    )?;
     Ok(client)
 }
 
@@ -451,6 +453,9 @@ fn scan_authors(client: &mut Client, dir: &Path) -> Result<u64> {
         }
     }
     writer.finish()?;
+    // Fresh unlogged tables have no statistics until analyzed, and the merge
+    // queries pick disastrous plans without them.
+    client.batch_execute("ANALYZE _import_authors_staging")?;
     finish_scan(&bar, written, skipped);
     Ok(written)
 }
@@ -528,6 +533,7 @@ fn scan_works(client: &mut Client, refs_client: &mut Client, dir: &Path) -> Resu
     }
     writer.finish()?;
     refs_writer.finish()?;
+    client.batch_execute("ANALYZE _import_works_staging; ANALYZE _import_work_author_refs")?;
     finish_scan(&bar, written, skipped);
     Ok(written)
 }
@@ -631,6 +637,7 @@ fn stage_editions(client: &mut Client, dir: &Path, dev: bool) -> Result<u64> {
         }
     }
     writer.finish()?;
+    client.batch_execute("ANALYZE _import_editions_staging")?;
     let mut extra = format!(
         "({no_work} without a work dropped, {wrong_language} not in {})",
         IMPORT_LANGUAGES.join("/")
